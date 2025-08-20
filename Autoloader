@@ -1,0 +1,54 @@
+dbutils.widgets.text("ref_id", "")
+dbutils.widgets.text("config_catalog", "")
+dbutils.widgets.text("config_schema", "")
+dbutils.widgets.text("config_table", "")
+# Step 1: Accept ref_id as a job parameter
+ref_id_str = dbutils.widgets.get("ref_id")
+config_catalog = dbutils.widgets.get("config_catalog")
+config_schema = dbutils.widgets.get("config_schema")
+config_table = dbutils.widgets.get("config_table")
+
+if not ref_id_str.isdigit():
+    raise ValueError("Invalid or missing ref_id. Please pass a numeric ref_id as a parameter.")
+
+ref_id = int(ref_id_str)
+
+# Step 2: Fetch configuration from the config table
+config_df = spark.table(f"{config_catalog}.{config_schema}.{config_table}").filter(f"ref_id = {ref_id}")
+
+if config_df.count() == 0:
+    raise ValueError(f"No configuration found for ref_id = {ref_id}")
+config = config_df.collect()[0]
+input_path = config["input_path"]
+file_format = config["file_format"]
+schema_path = config["schema_path"]
+#archive_path = config["archive_path"]
+checkpoint_path = config["checkpoint_path"]
+table_catalog = config["table_catalog"]
+table_schema = config["table_schema"]
+ingst_tbl_name = config["ingst_tbl_name"]
+glob_filter = config["glob_filter"]
+
+# Step 3: Configure and run Auto Loader
+df = (
+    spark.readStream
+        .format("cloudFiles")
+        .option("cloudFiles.format", file_format)
+        .option("header", "true")
+        .option("cloudFiles.inferColumnTypes", "true")
+        .option("cloudFiles.includeExistingFiles", "true")
+        .option("cloudFiles.schemaEvolutionMode", "rescue")
+        .option("cloudFiles.schemaLocation", schema_path)
+        #.option("cloudFiles.cleanSource", "MOVE") \
+        #.option("cloudFiles.cleanSource.moveDestination", "/Volumes/dev_sdh_db/tms/mdt-nonprod-tms-us-east-1/test_02/archive_02/")
+        #.option("cloudFiles.archiveDir", archive_path)  # Archive processed files here
+        .option("cloudFiles.validateOptions", "false")
+        .option("pathGlobFilter", glob_filter)
+        .load(input_path)
+)
+df.writeStream \
+    .format("delta") \
+    .option("checkpointLocation", checkpoint_path) \
+    .option("mergeSchema", "true") \
+    .outputMode("append") \
+    .table(f"{table_catalog}.{table_schema}.{ingst_tbl_name}")
