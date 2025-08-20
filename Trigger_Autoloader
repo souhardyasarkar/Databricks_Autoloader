@@ -1,0 +1,86 @@
+#Step 1: Define widgets to accept parameters from the user or calling process
+dbutils.widgets.text("table_catalog", "")  # Catalog name where config and log tables reside
+dbutils.widgets.text("table_schema", "")   # Schema name for config and log tables
+dbutils.widgets.text("code_path", "/Workspace/Shared/core-dih-dabs_R1A_POD_10/src/sds_main/notebooks/Autoloader")      # Path to the notebook that should be triggered
+dbutils.widgets.text("src_sys_cd", "")     #we can define the source system code as per our requirement
+dbutils.widgets.text("notebook_name", "")
+dbutils.widgets.text("config_table", "")
+dbutils.widgets.text("log_table", "")
+# Step 2: Retrieve widget values
+table_catalog = dbutils.widgets.get("table_catalog")
+table_schema = dbutils.widgets.get("table_schema")
+code_path = dbutils.widgets.get("code_path")
+src_sys_cd = dbutils.widgets.get("src_sys_cd")
+notebook_name = dbutils.widgets.get("notebook_name") 
+config_table = dbutils.widgets.get("config_table")
+log_table = dbutils.widgets.get("log_table")
+
+
+# Step 3: Import necessary libraries
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pyspark.sql.functions import current_timestamp
+import pyspark.sql.types as T
+
+# Step 4: Function to run autoloader notebook
+def run_autoloader_notebook(ref_id: str):
+    try:
+        print(f"🔄 Running autoloader for ref_id: {ref_id}")
+        dbutils.notebook.run(
+            f"{code_path}/{notebook_name}",
+            timeout_seconds=30000000,
+            arguments={"ref_id": ref_id}
+        )
+        print(f"✅ Success for ref_id: {ref_id}")
+        return (ref_id, "SUCCESS", "")
+    except Exception as e:
+        err = str(e).replace("'", "")
+        print(f"❌ Error for ref_id {ref_id}: {err}")
+        return (ref_id, "FAILURE", err)
+
+# Step 5: Fetch ref_ids for the given src_sys_cd
+ref_id_rows = spark.sql(f"""
+    SELECT DISTINCT ref_id
+    FROM {table_catalog}.{table_schema}.{config_table}
+    WHERE src_sys_cd = '{src_sys_cd}'
+""").collect()
+
+# Step 6: Extract ref_ids and print count
+ref_ids = [row.ref_id for row in ref_id_rows]
+count_ref_id=len(ref_ids) ##count of ref_id for the respective src_sys_cd
+print(f"🔍 Found {count_ref_id} ref_id(s) for src_sys_cd = '{src_sys_cd}'")
+
+# Step 7: Run notebooks in parallel
+results = []
+with ThreadPoolExecutor(max_workers=count_ref_id) as executor:
+    futures = {executor.submit(run_autoloader_notebook, rid): rid for rid in ref_ids}
+    for future in as_completed(futures):
+        results.append(future.result())
+
+# Step 8: Define schema for logging
+schema = T.StructType([
+    T.StructField("ref_id", T.StringType(), True),
+    T.StructField("status", T.StringType(), True),
+    T.StructField("error_message", T.StringType(), True),
+    T.StructField("execution_timestamp", T.TimestampType(), True)
+])
+
+# Step 9: Create log DataFrame
+log_df = spark.createDataFrame(
+    [(rid, stat, err, None) for (rid, stat, err) in results],
+    schema=schema
+).withColumn("execution_timestamp", current_timestamp())
+
+# Step 10: Write to Delta table
+log_df.write \
+    .format("delta") \
+    .mode("append") \
+    .saveAsTable(f"{table_catalog}.{table_schema}.{log_table}")
+
+# Step 11: Print summary
+print("=== RUN SUMMARY ===")
+for ref_id, status, err in results:
+    msg = f"{ref_id} ➡️ {status}"
+    if status == "FAILURE":
+        msg += f" ({err})"
+    print(msg)
+
